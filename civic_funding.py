@@ -1,14 +1,15 @@
 """
 title: Civic Funding Intelligence
 author: ChangeAgent AI
-description: Search federal grants (Grants.gov) and private foundations (IRS 990-PF) — discover government and philanthropic funding opportunities.
-version: 0.1.0
+description: Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), and state award recipients.
+version: 0.2.0
 requirements: httpx
 """
 
+import asyncio
 import json
 import os
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -16,11 +17,15 @@ SYSTEM_PROMPT_INJECTION = """
 ### Civic Funding Intelligence — Usage Guide
 Use this tool for grants and philanthropic funding:
 - `search_grants` — Federal grant opportunities from Grants.gov (government money available to apply for)
+- `search_state_grants` — State-level grant opportunities across all 50 states (128 sources)
+- `search_state_awards` — Who received state grant funding
+- `get_state_grant` — Full detail for a specific state grant
 - `search_foundations` — Private foundations that fund causes (IRS 990-PF data)
 - `search_foundation_grants` — What a specific foundation has funded
 - `get_grant` / `get_foundation` — Detailed views of specific records
 Do NOT use this tool for federal contracts — use the Civic Procurement tool instead.
 Key distinction: GRANTS fund projects/programs. CONTRACTS (procurement) pay for services.
+State vs federal: If the user mentions a specific US state or "state grants", use search_state_grants. For federal/national grants, use search_grants.
 """
 
 
@@ -48,11 +53,18 @@ class Tools:
     class Valves(BaseModel):
         GOVCON_API_URL: str = Field(
             default_factory=lambda: os.getenv("GOVCON_API_URL", "https://govcon-api-production.up.railway.app"),
-            description="GovCon Civic Intelligence API base URL",
+            description="GovCon Civic Intelligence API base URL (federal grants, foundations)",
+        )
+        CIVIC_FUNDING_URL: str = Field(
+            default_factory=lambda: os.getenv(
+                "CIVIC_FUNDING_URL",
+                "https://civic-funding-production.up.railway.app",
+            ),
+            description="Civic Funding API base URL (state grants, state awards)",
         )
         GOVCON_API_KEY: str = Field(
             default_factory=lambda: os.getenv("GOVCON_API_KEY", ""),
-            description="Bearer token for GovCon API authentication",
+            description="Bearer token for API authentication",
         )
         TIMEOUT: int = Field(default=30, description="HTTP request timeout in seconds")
 
@@ -65,14 +77,64 @@ class Tools:
             h["Authorization"] = f"Bearer {self.valves.GOVCON_API_KEY}"
         return h
 
-    async def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    # ── Anti-fragile HTTP helpers ──────────────────────────────────
+
+    async def _get_govcon(
+        self, path: str, params: Optional[Dict[str, Any]] = None
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """GET from govcon-api. Returns (data, None) or (None, error)."""
+        return await self._get_with_retry(
+            f"{self.valves.GOVCON_API_URL.rstrip('/')}/api{path}", params
+        )
+
+    async def _get_funding(
+        self, path: str, params: Optional[Dict[str, Any]] = None
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """GET from civic-funding. Returns (data, None) or (None, error)."""
+        return await self._get_with_retry(
+            f"{self.valves.CIVIC_FUNDING_URL.rstrip('/')}/api{path}", params
+        )
+
+    async def _get_with_retry(
+        self, url: str, params: Optional[Dict[str, Any]] = None
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Anti-fragile GET: 2 attempts on 5xx/connection errors. Never raises."""
         import httpx
-        url = f"{self.valves.GOVCON_API_URL.rstrip('/')}/api{path}"
+
         cleaned = {k: v for k, v in (params or {}).items() if v is not None}
-        async with httpx.AsyncClient(timeout=self.valves.TIMEOUT) as client:
-            resp = await client.get(url, params=cleaned, headers=self._headers())
-            resp.raise_for_status()
-            return resp.json()
+        t = self.valves.TIMEOUT
+        backoffs = [1, 3]
+
+        last_error = ""
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=t) as client:
+                    resp = await client.get(url, params=cleaned, headers=self._headers())
+                    if resp.status_code >= 500 and attempt < 1:
+                        last_error = f"Server error ({resp.status_code})"
+                        await asyncio.sleep(backoffs[attempt])
+                        continue
+                    if resp.status_code == 401:
+                        return None, "Authentication failed — check API key configuration"
+                    if resp.status_code == 404:
+                        return None, "Resource not found"
+                    if resp.status_code >= 400:
+                        return None, f"Request error ({resp.status_code})"
+                    return resp.json(), None
+            except httpx.TimeoutException:
+                last_error = f"Request timed out after {t}s"
+                if attempt < 1:
+                    await asyncio.sleep(backoffs[attempt])
+                    continue
+            except httpx.ConnectError:
+                last_error = "Service unavailable — connection failed"
+                if attempt < 1:
+                    await asyncio.sleep(backoffs[attempt])
+                    continue
+            except Exception as e:
+                return None, f"Unexpected error: {str(e)[:200]}"
+
+        return None, last_error
 
     @staticmethod
     def _fmt_money(val) -> str:
@@ -83,7 +145,7 @@ class Tools:
         except (ValueError, TypeError):
             return str(val)
 
-    # ── Tool methods ──────────────────────────────────────────────
+    # ── Federal grants (govcon-api) ────────────────────────────────
 
     async def search_grants(
         self,
@@ -108,17 +170,16 @@ class Tools:
         emitter = EventEmitter(__event_emitter__)
         await emitter.progress_update(f"Searching federal grants: {query}")
 
-        try:
-            data = await self._get("/grants", {
-                "search": query,
-                "agency_code": agency,
-                "status": status,
-                "page": page,
-                "page_size": 25,
-            })
-        except Exception as e:
-            await emitter.error_update(f"Search failed: {e}")
-            return f"Error: Failed to search grants — {e}"
+        data, error = await self._get_govcon("/grants", {
+            "search": query,
+            "agency_code": agency,
+            "status": status,
+            "page": page,
+            "page_size": 25,
+        })
+        if error:
+            await emitter.error_update(f"Search failed: {error}")
+            return f"Error: Failed to search grants — {error}"
 
         items = data.get("results", [])
         total = data.get("total_results", len(items))
@@ -176,12 +237,12 @@ class Tools:
         emitter = EventEmitter(__event_emitter__)
         await emitter.progress_update(f"Fetching grant {grant_id}...")
 
-        try:
-            grant = await self._get(f"/grants/{grant_id}")
-        except Exception as e:
-            await emitter.error_update(f"Fetch failed: {e}")
-            return f"Error: Failed to fetch grant {grant_id} — {e}"
+        data, error = await self._get_govcon(f"/grants/{grant_id}")
+        if error:
+            await emitter.error_update(f"Fetch failed: {error}")
+            return f"Error: Failed to fetch grant {grant_id} — {error}"
 
+        grant = data
         lines = [f"## Federal Grant Detail\n"]
         lines.append(f"**{grant.get('title', 'Untitled')}**\n")
 
@@ -214,6 +275,8 @@ class Tools:
         await emitter.success_update("Grant details retrieved")
         return "\n".join(lines)
 
+    # ── Foundations (govcon-api) ────────────────────────────────────
+
     async def search_foundations(
         self,
         query: str,
@@ -237,17 +300,16 @@ class Tools:
         emitter = EventEmitter(__event_emitter__)
         await emitter.progress_update(f"Searching private foundations: {query}")
 
-        try:
-            data = await self._get("/foundations", {
-                "search": query,
-                "state": state,
-                "min_giving": min_giving,
-                "page": page,
-                "page_size": 25,
-            })
-        except Exception as e:
-            await emitter.error_update(f"Search failed: {e}")
-            return f"Error: Failed to search foundations — {e}"
+        data, error = await self._get_govcon("/foundations", {
+            "search": query,
+            "state": state,
+            "min_giving": min_giving,
+            "page": page,
+            "page_size": 25,
+        })
+        if error:
+            await emitter.error_update(f"Search failed: {error}")
+            return f"Error: Failed to search foundations — {error}"
 
         items = data.get("results", [])
         total = data.get("total_results", len(items))
@@ -299,12 +361,12 @@ class Tools:
         emitter = EventEmitter(__event_emitter__)
         await emitter.progress_update(f"Fetching foundation {ein}...")
 
-        try:
-            fnd = await self._get(f"/foundations/{ein}")
-        except Exception as e:
-            await emitter.error_update(f"Fetch failed: {e}")
-            return f"Error: Failed to fetch foundation {ein} — {e}"
+        data, error = await self._get_govcon(f"/foundations/{ein}")
+        if error:
+            await emitter.error_update(f"Fetch failed: {error}")
+            return f"Error: Failed to fetch foundation {ein} — {error}"
 
+        fnd = data
         lines = [f"## Foundation Profile\n"]
         lines.append(f"**{fnd.get('name', 'Unknown')}**\n")
 
@@ -348,16 +410,15 @@ class Tools:
         emitter = EventEmitter(__event_emitter__)
         await emitter.progress_update(f"Searching grants made by foundation {ein}...")
 
-        try:
-            data = await self._get(f"/foundations/{ein}/grants", {
-                "search": search,
-                "min_amount": min_amount,
-                "page": page,
-                "page_size": 25,
-            })
-        except Exception as e:
-            await emitter.error_update(f"Search failed: {e}")
-            return f"Error: Failed to search foundation grants — {e}"
+        data, error = await self._get_govcon(f"/foundations/{ein}/grants", {
+            "search": search,
+            "min_amount": min_amount,
+            "page": page,
+            "page_size": 25,
+        })
+        if error:
+            await emitter.error_update(f"Search failed: {error}")
+            return f"Error: Failed to search foundation grants — {error}"
 
         items = data.get("results", [])
         total = data.get("total_results", len(items))
@@ -391,4 +452,293 @@ class Tools:
             lines.append(f"_Showing page {page} of {(total + 24) // 25}. Use page={page + 1} for more._")
 
         await emitter.success_update(f"Found {total} grants from this foundation")
+        return "\n".join(lines)
+
+    # ── State grants & awards (civic-funding) ──────────────────────
+
+    async def search_state_grants(
+        self,
+        query: str = "",
+        state: Optional[str] = None,
+        agency: Optional[str] = None,
+        status: Optional[str] = None,
+        close_date_after: Optional[str] = None,
+        page: int = 1,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Search STATE-LEVEL grant opportunities across all 50 US states — sourced from 128 scrapers
+        covering state agencies, IntelliGrants, WebGrants, eCivis, Socrata, and CKAN portals. Use this
+        when the user asks about state grants, grants in a specific US state, or non-federal government
+        funding. For federal grants, use search_grants instead.
+
+        :param query: Search text (e.g., "housing", "workforce development", "clean energy")
+        :param state: Two-letter state code filter (e.g., "CA", "NY", "TX")
+        :param agency: State agency name filter — partial match (e.g., "Department of Education")
+        :param status: Grant status filter — open, closed, forecasted, or awarded
+        :param close_date_after: Only grants closing on or after this date (YYYY-MM-DD)
+        :param page: Page number (default: 1)
+        :return: List of state grant opportunities with title, state, agency, amount, deadline, and source portal.
+        """
+        emitter = EventEmitter(__event_emitter__)
+        desc = f"state grants: {query}" if query else "state grants"
+        if state:
+            desc += f" in {state.upper()}"
+        await emitter.progress_update(f"Searching {desc}")
+
+        data, error = await self._get_funding("/state-grants", {
+            "search": query,
+            "state_code": state.upper() if state else None,
+            "agency_name": agency,
+            "status": status,
+            "close_date_after": close_date_after,
+            "page": page,
+            "page_size": 25,
+        })
+        if error:
+            await emitter.error_update(f"Search failed: {error}")
+            return f"Error: Failed to search state grants — {error}"
+
+        items = data.get("results", [])
+        total = data.get("total_results", len(items))
+
+        if not items:
+            await emitter.success_update("No state grants found")
+            parts = []
+            if query:
+                parts.append(f"'{query}'")
+            if state:
+                parts.append(f"in {state.upper()}")
+            return f"No state grant opportunities found {' '.join(parts)}." if parts else "No state grant opportunities found."
+
+        header = "## State Grant Opportunities\n\n"
+        header += f"Found **{total}** results"
+        if query:
+            header += f" for \"{query}\""
+        if state:
+            header += f" in {state.upper()}"
+        header += "\n"
+        lines = [header]
+
+        status_labels = {"open": "Open", "closed": "Closed", "forecasted": "Forecasted", "awarded": "Awarded"}
+        sources = set()
+
+        for i, grant in enumerate(items, 1):
+            title = grant.get("title", "Untitled")
+            grant_state = grant.get("state_code", "")
+            agency_name = grant.get("agency_name", "")
+            grant_status = grant.get("status") or ""
+            status_str = status_labels.get(grant_status.lower(), grant_status) if grant_status else ""
+            close_date = (grant.get("close_date") or "")[:10]
+            amount_min = grant.get("award_floor") or grant.get("amount_min")
+            amount_max = grant.get("award_ceiling") or grant.get("amount_max")
+            grant_id = grant.get("state_grant_id", "")
+            source_url = grant.get("source_url", "")
+            source_name = grant.get("source_name", "")
+
+            if source_name:
+                sources.add(source_name)
+
+            lines.append(f"{i}. **{title}**")
+            detail_parts = []
+            if grant_state:
+                detail_parts.append(f"State: {grant_state}")
+            if agency_name:
+                detail_parts.append(f"Agency: {agency_name}")
+            if status_str:
+                detail_parts.append(f"Status: {status_str}")
+            lines.append(f"   {' | '.join(detail_parts)}")
+
+            if amount_min or amount_max:
+                if amount_min and amount_max and amount_min != amount_max:
+                    lines.append(f"   Funding: {self._fmt_money(amount_min)} – {self._fmt_money(amount_max)}")
+                elif amount_max:
+                    lines.append(f"   Funding: up to {self._fmt_money(amount_max)}")
+                elif amount_min:
+                    lines.append(f"   Funding: from {self._fmt_money(amount_min)}")
+
+            if close_date:
+                lines.append(f"   Closes: {close_date}")
+
+            if source_url:
+                lines.append(f"   [View on state portal]({source_url})")
+
+            if grant_id:
+                lines.append(f"   _Use get_state_grant(\"{grant_id}\") for full details_")
+            lines.append("")
+
+        if total > page * 25:
+            lines.append(f"_Showing page {page} of {(total + 24) // 25}. Use page={page + 1} for more._\n")
+
+        if sources:
+            lines.append(f"**Sources:** {', '.join(sorted(sources))}")
+
+        await emitter.success_update(f"Found {total} state grant opportunities")
+        return "\n".join(lines)
+
+    async def get_state_grant(
+        self,
+        state_grant_id: str,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Get full details for a specific state grant opportunity. Use this after search_state_grants
+        to see the complete grant announcement including eligibility, funding details, deadlines,
+        and application instructions.
+
+        :param state_grant_id: The state grant ID (string) from search results
+        :return: Complete state grant details including description, eligibility, funding range, deadline, agency, and source link.
+        """
+        emitter = EventEmitter(__event_emitter__)
+        await emitter.progress_update(f"Fetching state grant {state_grant_id}...")
+
+        data, error = await self._get_funding(f"/state-grants/{state_grant_id}")
+        if error:
+            await emitter.error_update(f"Fetch failed: {error}")
+            return f"Error: Failed to fetch state grant {state_grant_id} — {error}"
+
+        grant = data
+        lines = [f"## State Grant Detail\n"]
+        lines.append(f"**{grant.get('title', 'Untitled')}**\n")
+
+        status_labels = {"open": "Open", "closed": "Closed", "forecasted": "Forecasted", "awarded": "Awarded"}
+        grant_status = grant.get("status") or ""
+
+        fields = [
+            ("State", grant.get("state_code")),
+            ("Agency", grant.get("agency_name")),
+            ("Status", status_labels.get(grant_status.lower(), grant_status) if grant_status else None),
+            ("Close Date", (grant.get("close_date") or "")[:10]),
+            ("Posted Date", (grant.get("posted_date") or "")[:10]),
+            ("Award Floor", self._fmt_money(grant.get("award_floor")) if grant.get("award_floor") else None),
+            ("Award Ceiling", self._fmt_money(grant.get("award_ceiling")) if grant.get("award_ceiling") else None),
+            ("Total Funding", self._fmt_money(grant.get("total_funding")) if grant.get("total_funding") else None),
+            ("Eligibility", grant.get("eligibility")),
+            ("Category", ", ".join(grant["categories"]) if grant.get("categories") else None),
+            ("Source", grant.get("source")),
+        ]
+        for label, val in fields:
+            if val:
+                lines.append(f"- **{label}:** {val}")
+
+        source_url = grant.get("source_url", "")
+        if source_url:
+            lines.append(f"- **Portal Link:** [{source_url}]({source_url})")
+
+        desc = grant.get("description", "")
+        if desc:
+            lines.append(f"\n### Description\n\n{desc[:3000]}")
+            if len(desc) > 3000:
+                lines.append("\n_[Description truncated — see state portal for full text]_")
+
+        await emitter.success_update("State grant details retrieved")
+        return "\n".join(lines)
+
+    async def search_state_awards(
+        self,
+        query: str = "",
+        state: Optional[str] = None,
+        agency: Optional[str] = None,
+        recipient: Optional[str] = None,
+        fiscal_year: Optional[int] = None,
+        min_amount: Optional[float] = None,
+        max_amount: Optional[float] = None,
+        page: int = 1,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Search STATE GRANT AWARD RECIPIENTS — find out who received state grant funding, how much,
+        and from which agency. Use this when the user asks "who got state grants for [topic]",
+        "state funding recipients in [state]", or wants to see actual disbursement data.
+
+        :param query: Search text (e.g., "education", "housing assistance")
+        :param state: Two-letter state code filter (e.g., "CA", "NY")
+        :param agency: State agency name filter — partial match
+        :param recipient: Recipient organization name filter — partial match
+        :param fiscal_year: Fiscal year filter (e.g., 2025)
+        :param min_amount: Minimum award amount in USD
+        :param max_amount: Maximum award amount in USD
+        :param page: Page number (default: 1)
+        :return: List of state grant awards with recipient name, amount, agency, state, and fiscal year.
+        """
+        emitter = EventEmitter(__event_emitter__)
+        desc = f"state awards: {query}" if query else "state awards"
+        if state:
+            desc += f" in {state.upper()}"
+        await emitter.progress_update(f"Searching {desc}")
+
+        data, error = await self._get_funding("/state-awards", {
+            "search": query,
+            "state_code": state.upper() if state else None,
+            "agency_name": agency,
+            "recipient_name": recipient,
+            "fiscal_year": fiscal_year,
+            "min_amount": min_amount,
+            "max_amount": max_amount,
+            "page": page,
+            "page_size": 25,
+        })
+        if error:
+            await emitter.error_update(f"Search failed: {error}")
+            return f"Error: Failed to search state awards — {error}"
+
+        items = data.get("results", [])
+        total = data.get("total_results", len(items))
+
+        if not items:
+            await emitter.success_update("No state awards found")
+            parts = []
+            if query:
+                parts.append(f"'{query}'")
+            if state:
+                parts.append(f"in {state.upper()}")
+            return f"No state grant awards found {' '.join(parts)}." if parts else "No state grant awards found."
+
+        header = "## State Grant Awards\n\n"
+        header += f"Found **{total}** results"
+        if query:
+            header += f" for \"{query}\""
+        if state:
+            header += f" in {state.upper()}"
+        header += "\n"
+        lines = [header]
+
+        sources = set()
+
+        for i, award in enumerate(items, 1):
+            recipient_name = award.get("recipient_name", "Unknown")
+            amount = award.get("award_amount") or award.get("amount")
+            agency_name = award.get("agency_name", "")
+            award_state = award.get("state_code", "")
+            year = award.get("fiscal_year", "")
+            program = award.get("program_name", "")
+            source_name = award.get("source_name", "")
+            source_url = award.get("source_url", "")
+
+            if source_name:
+                sources.add(source_name)
+
+            amount_str = self._fmt_money(amount) if amount else "N/A"
+            lines.append(f"{i}. **{recipient_name}** — {amount_str}")
+            detail_parts = []
+            if award_state:
+                detail_parts.append(f"State: {award_state}")
+            if agency_name:
+                detail_parts.append(f"Agency: {agency_name}")
+            if year:
+                detail_parts.append(f"FY{year}")
+            lines.append(f"   {' | '.join(detail_parts)}")
+            if program:
+                lines.append(f"   Program: {program}")
+            if source_url:
+                lines.append(f"   [View source]({source_url})")
+            lines.append("")
+
+        if total > page * 25:
+            lines.append(f"_Showing page {page} of {(total + 24) // 25}. Use page={page + 1} for more._\n")
+
+        if sources:
+            lines.append(f"**Sources:** {', '.join(sorted(sources))}")
+
+        await emitter.success_update(f"Found {total} state grant awards")
         return "\n".join(lines)

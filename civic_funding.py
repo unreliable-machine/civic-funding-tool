@@ -1,9 +1,13 @@
 """
 title: Civic Funding Intelligence
-author: ChangeAgent AI
+author: Sev
+author_url: https://thechange.ai
+id: civic_funding_intelligence
 description: Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), and state award recipients.
-version: 0.2.0
-requirements: httpx
+required_open_webui_version: 0.4.0
+requirements: httpx, pydantic
+version: 1.0.0
+license: MIT
 """
 
 import asyncio
@@ -13,19 +17,48 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
-SYSTEM_PROMPT_INJECTION = """
-### Civic Funding Intelligence — Usage Guide
-Use this tool for grants and philanthropic funding:
-- `search_grants` — Federal grant opportunities from Grants.gov (government money available to apply for)
-- `search_state_grants` — State-level grant opportunities across all 50 states (128 sources)
-- `search_state_awards` — Who received state grant funding
-- `get_state_grant` — Full detail for a specific state grant
-- `search_foundations` — Private foundations that fund causes (IRS 990-PF data)
-- `search_foundation_grants` — What a specific foundation has funded
-- `get_grant` / `get_foundation` — Detailed views of specific records
-Do NOT use this tool for federal contracts — use the Civic Procurement tool instead.
-Key distinction: GRANTS fund projects/programs. CONTRACTS (procurement) pay for services.
-State vs federal: If the user mentions a specific US state or "state grants", use search_state_grants. For federal/national grants, use search_grants.
+SYSTEM_PROMPT_INJECTION = """You have access to the Civic Funding Intelligence tool — a grants and philanthropic funding research toolkit with 8 functions.
+
+AVAILABLE FUNCTIONS:
+- funding_search_grants: Search 80,000+ federal grant opportunities from Grants.gov
+- funding_get_grant: Get full details for a specific federal grant by ID
+- funding_search_foundations: Search private foundations by NAME from IRS 990-PF filings
+- funding_get_foundation: Get full profile for a specific foundation by EIN
+- funding_search_foundation_grants: See what grants a SPECIFIC foundation has made (requires EIN)
+- funding_search_grants_by_purpose: Search ALL foundation grants by ISSUE AREA/PURPOSE — discover which foundations fund your cause
+- funding_search_state_grants: Search state-level grant opportunities across all 50 states (128 sources)
+- funding_get_state_grant: Get full details for a specific state grant
+- funding_search_state_awards: Search state grant award recipients (who received funding)
+
+WHEN TO USE WHICH:
+- "What grants can I apply for?" → funding_search_grants (federal) or funding_search_state_grants (state)
+- "What foundations fund [issue]?" → funding_search_grants_by_purpose (NOT funding_search_foundations)
+- "Who funds democracy work in NM?" → funding_search_grants_by_purpose(query="democracy", state="NM")
+- "Tell me about the Ford Foundation" → funding_search_foundations (search by name) + funding_get_foundation
+- "What has the Ford Foundation funded?" → funding_search_foundation_grants (requires EIN)
+- "Who got state grants for housing in California?" → funding_search_state_awards
+- "I'm a nonprofit in NM, what's available?" → funding_search_grants + funding_search_grants_by_purpose + funding_search_state_grants
+
+CRITICAL ROUTING RULE:
+- When the user asks "what foundations fund X" or "who funds X" where X is an issue area → ALWAYS use funding_search_grants_by_purpose
+- funding_search_foundations only searches foundation NAMES, not what they fund
+- funding_search_grants_by_purpose searches actual grant PURPOSE descriptions from IRS filings
+
+KEY DISTINCTION: GRANTS fund projects/programs. CONTRACTS (use GovCon Intelligence tool) pay for services.
+
+BEHAVIORAL RULES:
+- When a user asks what you can do, list ALL 8 functions with brief descriptions.
+- Before making a tool call, briefly tell the user what you're searching and why.
+- If the user's query could match both federal and state grants, search BOTH and present results together.
+- Always cite data sources (Grants.gov, state portals, IRS 990-PF).
+
+ANTI-HALLUCINATION (CRITICAL):
+- ONLY present data returned by tool calls. NEVER invent grant amounts, deadlines, agency names, EINs, or foundation details.
+- If a tool returns no results, say "no results found" — do NOT fill in with guesses or general knowledge about grants that might exist.
+- NEVER fabricate URLs. Only include URLs returned by the tool.
+- When summarizing results, use EXACT values from tool output. Do not round or approximate.
+- If the user asks about something not in the results, say "this was not in the search results."
+- NEVER say "based on my knowledge" about funding data. Either you have it from a tool call or you don't.
 """
 
 
@@ -147,7 +180,7 @@ class Tools:
 
     # ── Federal grants (govcon-api) ────────────────────────────────
 
-    async def search_grants(
+    async def funding_search_grants(
         self,
         query: str,
         agency: Optional[str] = None,
@@ -156,10 +189,9 @@ class Tools:
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> str:
         """
-        Search federal GRANT OPPORTUNITIES from Grants.gov — these are government funding opportunities
-        for organizations to apply for (NOT contracts for services). Use this when the user asks about
-        federal grants, government funding, grant opportunities, or "grants for [topic]." Grants fund
-        projects and programs; contracts (use civic_procurement) pay for services delivered.
+        : This Function is part of the Civic Funding Intelligence Tool. Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), and state award recipients.</TOOL INFO>
+
+        Search federal GRANT OPPORTUNITIES from Grants.gov — government funding opportunities for organizations to apply for (NOT contracts for services). Use when the user asks about federal grants, government funding, or "grants for [topic]."</Function Definition>
 
         :param query: Search text (e.g., "education", "STEM workforce development")
         :param agency: Agency code filter (e.g., "HHS", "DOE", "NSF")
@@ -186,7 +218,7 @@ class Tools:
 
         if not items:
             await emitter.success_update("No grants found")
-            return f"No federal grant opportunities found for '{query}'."
+            return f"No federal grant opportunities found for '{query}'. Do NOT fabricate data — suggest the user try different search terms."
 
         status_labels = {"P": "Open", "F": "Forecasted", "C": "Closed", "A": "Archived"}
         lines = [f"## Federal Grant Opportunities\n\nFound **{total}** results for \"{query}\"\n"]
@@ -212,7 +244,7 @@ class Tools:
             if close_date:
                 lines.append(f"   Closes: {close_date}")
             if grant_id:
-                lines.append(f"   _ID: {grant_id} — use get_grant({grant_id}) for details_")
+                lines.append(f"   _ID: {grant_id} — use funding_get_grant({grant_id}) for details_")
             lines.append("")
 
         if total > page * 25:
@@ -221,15 +253,15 @@ class Tools:
         await emitter.success_update(f"Found {total} grant opportunities")
         return "\n".join(lines)
 
-    async def get_grant(
+    async def funding_get_grant(
         self,
         grant_id: int,
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> str:
         """
-        Get full details for a specific federal grant opportunity from Grants.gov. Use this after
-        search_grants to get the complete grant announcement including eligibility, funding details,
-        and application instructions.
+        : This Function is part of the Civic Funding Intelligence Tool. Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), and state award recipients.</TOOL INFO>
+
+        Get full details for a specific federal grant opportunity from Grants.gov. Use after funding_search_grants to get the complete grant announcement including eligibility, funding details, and application instructions.</Function Definition>
 
         :param grant_id: The grant ID (integer) from search results
         :return: Complete grant details including description, eligibility, funding range, application deadline, and agency contact.
@@ -277,7 +309,7 @@ class Tools:
 
     # ── Foundations (govcon-api) ────────────────────────────────────
 
-    async def search_foundations(
+    async def funding_search_foundations(
         self,
         query: str,
         state: Optional[str] = None,
@@ -286,10 +318,9 @@ class Tools:
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> str:
         """
-        Search PRIVATE FOUNDATIONS from IRS 990-PF filings — these are philanthropic foundations that
-        give money to nonprofits and causes. Use this when the user asks about private foundations,
-        philanthropic funders, "foundations that fund [topic]", or foundation giving in a specific state.
-        This is about the FUNDERS themselves, not their individual grants (use search_foundation_grants for that).
+        : This Function is part of the Civic Funding Intelligence Tool. Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), and state award recipients.</TOOL INFO>
+
+        Search PRIVATE FOUNDATIONS from IRS 990-PF filings — philanthropic foundations that give money to nonprofits and causes. Use when the user asks about private foundations, philanthropic funders, or foundation giving in a specific state.</Function Definition>
 
         :param query: Search text — foundation name (e.g., "Ford Foundation", "Gates")
         :param state: Two-letter state code filter (e.g., "NY", "CA")
@@ -316,7 +347,7 @@ class Tools:
 
         if not items:
             await emitter.success_update("No foundations found")
-            return f"No private foundations found for '{query}'."
+            return f"No private foundations found for '{query}'. Do NOT fabricate data — suggest the user try different search terms."
 
         lines = [f"## Private Foundations\n\nFound **{total}** results for \"{query}\"\n"]
         for i, fnd in enumerate(items, 1):
@@ -336,7 +367,7 @@ class Tools:
             detail_parts.append(f"Assets: {assets_str}")
             detail_parts.append(f"Total Giving: {giving_str}")
             lines.append(f"   {' | '.join(detail_parts)}")
-            lines.append(f"   _Use get_foundation(\"{ein}\") for profile, search_foundation_grants(\"{ein}\") for their grants_")
+            lines.append(f"   _Use funding_get_foundation(\"{ein}\") for profile, funding_search_foundation_grants(\"{ein}\") for their grants_")
             lines.append("")
 
         if total > page * 25:
@@ -345,15 +376,15 @@ class Tools:
         await emitter.success_update(f"Found {total} foundations")
         return "\n".join(lines)
 
-    async def get_foundation(
+    async def funding_get_foundation(
         self,
         ein: str,
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> str:
         """
-        Get full details for a specific private foundation by its EIN (Employer Identification Number).
-        Use this after search_foundations to see a foundation's complete profile including financial
-        details from their IRS 990-PF filing.
+        : This Function is part of the Civic Funding Intelligence Tool. Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), and state award recipients.</TOOL INFO>
+
+        Get full details for a specific private foundation by its EIN. Use after funding_search_foundations to see a foundation's complete profile including financial details from their IRS 990-PF filing.</Function Definition>
 
         :param ein: The foundation's EIN, with or without dash (e.g., "13-1837418" or "131837418")
         :return: Foundation profile with name, address, total assets, total giving, fiscal details, and officer information.
@@ -388,7 +419,7 @@ class Tools:
         await emitter.success_update("Foundation details retrieved")
         return "\n".join(lines)
 
-    async def search_foundation_grants(
+    async def funding_search_foundation_grants(
         self,
         ein: str,
         search: Optional[str] = None,
@@ -397,9 +428,9 @@ class Tools:
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> str:
         """
-        Search grants MADE BY a specific private foundation — these are donations and grants the
-        foundation has given to other organizations. Use this when the user asks "what has [foundation]
-        funded?", "who does [foundation] give to?", or wants to see a foundation's grantmaking history.
+        : This Function is part of the Civic Funding Intelligence Tool. Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), and state award recipients.</TOOL INFO>
+
+        Search grants MADE BY a specific private foundation — donations and grants the foundation has given to other organizations. Use when the user asks "what has [foundation] funded?" or wants to see a foundation's grantmaking history.</Function Definition>
 
         :param ein: The foundation's EIN (e.g., "13-1837418")
         :param search: Search text to filter grant recipients or purposes
@@ -428,6 +459,7 @@ class Tools:
             msg = f"No grants found for foundation {ein}."
             if not search:
                 msg += " This foundation's grant data may not be available yet (requires Phase 2 XML extraction)."
+            msg += " Do NOT fabricate data — suggest the user try different search terms."
             return msg
 
         lines = [f"## Grants Made by Foundation {ein}\n\nFound **{total}** grants\n"]
@@ -454,9 +486,114 @@ class Tools:
         await emitter.success_update(f"Found {total} grants from this foundation")
         return "\n".join(lines)
 
+    # ── Foundation grants by purpose (govcon-api) ───────────────────
+
+    async def funding_search_grants_by_purpose(
+        self,
+        query: str,
+        state: Optional[str] = None,
+        min_amount: Optional[float] = None,
+        since_year: Optional[int] = None,
+        page: int = 1,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        : This Function is part of the Civic Funding Intelligence Tool. Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), and state award recipients.</TOOL INFO>
+
+        Search ALL foundation grants by PURPOSE or ISSUE AREA — discover which foundations have actually funded work in your area. This is the PRIMARY function for "what foundations fund [topic]?" queries. Searches actual grant descriptions from IRS 990-PF filings, not just foundation names.</Function Definition>
+
+        :param query: Issue area or purpose (e.g., "civic engagement", "democracy", "housing", "education")
+        :param state: Two-letter state code to filter by recipient state (e.g., "NM", "CA")
+        :param min_amount: Minimum grant amount in USD (e.g., 10000)
+        :param since_year: Only include grants from this tax year onward (e.g., 2020)
+        :param page: Page number (default: 1)
+        :return: List of foundation grants matching the purpose, with foundation name, recipient, amount, and purpose.
+        """
+        emitter = EventEmitter(__event_emitter__)
+        desc = f"foundation grants for: {query}"
+        if state:
+            desc += f" in {state.upper()}"
+        await emitter.progress_update(f"Searching {desc}")
+
+        data, error = await self._get_govcon("/foundations/grants/search", {
+            "search": query,
+            "state": state.upper() if state else None,
+            "min_amount": min_amount,
+            "since_year": since_year,
+            "page": page,
+            "page_size": 25,
+        })
+        if error:
+            await emitter.error_update(f"Search failed: {error}")
+            return f"Error: Failed to search foundation grants by purpose — {error}"
+
+        items = data.get("results", [])
+        total = data.get("total_results", len(items))
+
+        if not items:
+            await emitter.success_update("No foundation grants found")
+            parts = [f"'{query}'"]
+            if state:
+                parts.append(f"in {state.upper()}")
+            return f"No foundation grants found for {' '.join(parts)}. Do NOT fabricate data — suggest the user try broader search terms or remove the state filter."
+
+        header = f"## Foundation Grants for \"{query}\"\n\n"
+        header += f"Found **{total}** grants"
+        if state:
+            header += f" with recipients in {state.upper()}"
+        header += "\n"
+        lines = [header]
+
+        # Track unique foundations for summary
+        foundations_seen = {}
+
+        for i, grant in enumerate(items, 1):
+            foundation_name = grant.get("foundation_name", "Unknown Foundation")
+            foundation_ein = grant.get("foundation_ein", "")
+            recipient = grant.get("recipient_name", "Unknown")
+            amount = grant.get("amount")
+            purpose = grant.get("purpose", "")
+            tax_year = grant.get("tax_year", "")
+            recipient_state = grant.get("recipient_state", "")
+
+            amount_str = f"${float(amount):,.0f}" if amount else "N/A"
+
+            lines.append(f"{i}. **{foundation_name}** → {recipient} — {amount_str}")
+            detail_parts = []
+            if purpose:
+                detail_parts.append(purpose[:200])
+            if tax_year:
+                detail_parts.append(f"Year: {tax_year}")
+            if recipient_state:
+                detail_parts.append(f"State: {recipient_state}")
+            if detail_parts:
+                lines.append(f"   {' | '.join(detail_parts)}")
+            lines.append("")
+
+            # Track foundation totals
+            if foundation_ein:
+                if foundation_ein not in foundations_seen:
+                    foundations_seen[foundation_ein] = {"name": foundation_name, "total": 0, "count": 0}
+                foundations_seen[foundation_ein]["total"] += float(amount) if amount else 0
+                foundations_seen[foundation_ein]["count"] += 1
+
+        # Summary of top foundations
+        if foundations_seen:
+            sorted_foundations = sorted(foundations_seen.values(), key=lambda x: x["total"], reverse=True)[:5]
+            lines.append("### Top Funders in These Results")
+            for f in sorted_foundations:
+                lines.append(f"- **{f['name']}** — {f['count']} grants, ${f['total']:,.0f} total")
+            lines.append("")
+
+        if total > page * 25:
+            lines.append(f"_Showing page {page} of {(total + 24) // 25}. Use page={page + 1} for more._")
+
+        await emitter.success_update(f"Found {total} foundation grants for '{query}'")
+        return "\n".join(lines)
+
     # ── State grants & awards (civic-funding) ──────────────────────
 
-    async def search_state_grants(
+    async def funding_search_state_grants(
         self,
         query: str = "",
         state: Optional[str] = None,
@@ -467,10 +604,9 @@ class Tools:
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> str:
         """
-        Search STATE-LEVEL grant opportunities across all 50 US states — sourced from 128 scrapers
-        covering state agencies, IntelliGrants, WebGrants, eCivis, Socrata, and CKAN portals. Use this
-        when the user asks about state grants, grants in a specific US state, or non-federal government
-        funding. For federal grants, use search_grants instead.
+        : This Function is part of the Civic Funding Intelligence Tool. Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), and state award recipients.</TOOL INFO>
+
+        Search STATE-LEVEL grant opportunities across all 50 US states — sourced from 128 scrapers covering state agencies, IntelliGrants, WebGrants, eCivis, Socrata, and CKAN portals. For federal grants, use funding_search_grants instead.</Function Definition>
 
         :param query: Search text (e.g., "housing", "workforce development", "clean energy")
         :param state: Two-letter state code filter (e.g., "CA", "NY", "TX")
@@ -509,7 +645,7 @@ class Tools:
                 parts.append(f"'{query}'")
             if state:
                 parts.append(f"in {state.upper()}")
-            return f"No state grant opportunities found {' '.join(parts)}." if parts else "No state grant opportunities found."
+            return (f"No state grant opportunities found {' '.join(parts)}." if parts else "No state grant opportunities found.") + " Do NOT fabricate data — suggest the user try different search terms."
 
         header = "## State Grant Opportunities\n\n"
         header += f"Found **{total}** results"
@@ -564,7 +700,7 @@ class Tools:
                 lines.append(f"   [View on state portal]({source_url})")
 
             if grant_id:
-                lines.append(f"   _Use get_state_grant(\"{grant_id}\") for full details_")
+                lines.append(f"   _Use funding_get_state_grant(\"{grant_id}\") for full details_")
             lines.append("")
 
         if total > page * 25:
@@ -576,15 +712,15 @@ class Tools:
         await emitter.success_update(f"Found {total} state grant opportunities")
         return "\n".join(lines)
 
-    async def get_state_grant(
+    async def funding_get_state_grant(
         self,
         state_grant_id: str,
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> str:
         """
-        Get full details for a specific state grant opportunity. Use this after search_state_grants
-        to see the complete grant announcement including eligibility, funding details, deadlines,
-        and application instructions.
+        : This Function is part of the Civic Funding Intelligence Tool. Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), and state award recipients.</TOOL INFO>
+
+        Get full details for a specific state grant opportunity. Use after funding_search_state_grants to see the complete grant announcement including eligibility, funding details, deadlines, and application instructions.</Function Definition>
 
         :param state_grant_id: The state grant ID (string) from search results
         :return: Complete state grant details including description, eligibility, funding range, deadline, agency, and source link.
@@ -634,7 +770,7 @@ class Tools:
         await emitter.success_update("State grant details retrieved")
         return "\n".join(lines)
 
-    async def search_state_awards(
+    async def funding_search_state_awards(
         self,
         query: str = "",
         state: Optional[str] = None,
@@ -647,9 +783,9 @@ class Tools:
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> str:
         """
-        Search STATE GRANT AWARD RECIPIENTS — find out who received state grant funding, how much,
-        and from which agency. Use this when the user asks "who got state grants for [topic]",
-        "state funding recipients in [state]", or wants to see actual disbursement data.
+        : This Function is part of the Civic Funding Intelligence Tool. Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), and state award recipients.</TOOL INFO>
+
+        Search STATE GRANT AWARD RECIPIENTS — find out who received state grant funding, how much, and from which agency. Use when the user asks "who got state grants for [topic]" or wants to see actual disbursement data.</Function Definition>
 
         :param query: Search text (e.g., "education", "housing assistance")
         :param state: Two-letter state code filter (e.g., "CA", "NY")
@@ -692,7 +828,7 @@ class Tools:
                 parts.append(f"'{query}'")
             if state:
                 parts.append(f"in {state.upper()}")
-            return f"No state grant awards found {' '.join(parts)}." if parts else "No state grant awards found."
+            return (f"No state grant awards found {' '.join(parts)}." if parts else "No state grant awards found.") + " Do NOT fabricate data — suggest the user try different search terms."
 
         header = "## State Grant Awards\n\n"
         header += f"Found **{total}** results"

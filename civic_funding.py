@@ -3,10 +3,10 @@ title: Civic Funding Intelligence
 author: Sev
 author_url: https://thechange.ai
 id: civic_funding_intelligence
-description: Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), and state award recipients.
+description: Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), top funders by state, and active RFPs with deadlines.
 required_open_webui_version: 0.4.0
 requirements: httpx, pydantic
-version: 1.0.0
+version: 2.0.0
 license: MIT
 """
 

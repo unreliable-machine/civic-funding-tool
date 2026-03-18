@@ -189,32 +189,67 @@ class Tools:
         """
         emitter = EventEmitter(__event_emitter__)
 
-        # Extract search terms from the description — use the key phrases
-        # Strip common filler words to get issue-area terms
-        filler = {"i'm", "im", "a", "an", "the", "we", "are", "our", "is", "in", "of",
-                  "and", "for", "to", "that", "with", "on", "at", "by", "my", "this",
-                  "nonprofit", "non-profit", "501c3", "501c4", "501(c)(3)", "501(c)(4)",
-                  "organization", "org", "small", "large", "new", "what", "grants",
-                  "should", "apply", "can", "get", "looking", "funding", "money"}
-        words = description.lower().split()
-        issue_terms = " ".join(w for w in words if w.strip(",.?!") not in filler)
-        if not issue_terms.strip():
-            issue_terms = description  # fallback to full description
+        # Extract 2-3 short search phrases from the description.
+        # Strategy: pull recognizable issue-area bigrams/trigrams, not strip words.
+        desc_lower = description.lower()
+
+        # Known issue-area phrases to detect (order = priority)
+        known_phrases = [
+            "civic engagement", "community organizing", "voter engagement",
+            "voting rights", "democracy", "social justice", "racial justice",
+            "climate justice", "environmental justice", "health equity",
+            "criminal justice", "immigration", "housing", "education",
+            "workforce development", "economic justice", "reproductive rights",
+            "gun violence", "public health", "child welfare", "early childhood",
+            "narrative change", "media", "communications", "advocacy",
+            "organizing", "civil rights", "human rights", "LGBTQ",
+            "indigenous", "tribal", "rural", "urban",
+        ]
+        # Find which known phrases appear in the description
+        matched = [p for p in known_phrases if p in desc_lower]
+
+        # If no known phrases matched, extract content words as fallback
+        if not matched:
+            filler = {"i'm", "im", "a", "an", "the", "we", "are", "our", "is", "in", "of",
+                      "and", "for", "to", "that", "with", "on", "at", "by", "my", "this",
+                      "nonprofit", "non-profit", "501c3", "501c4", "501(c)(3)", "501(c)(4)",
+                      "organization", "org", "small", "large", "new", "what", "grants",
+                      "should", "apply", "can", "get", "looking", "funding", "money",
+                      "focused", "based", "work", "do", "does", "about", "i", "me",
+                      "progress", "now"}  # org name words likely to pollute
+            words = description.lower().split()
+            content = [w.strip(",.?!-()") for w in words if w.strip(",.?!-()") not in filler and len(w) > 2]
+            # Take up to 3 content words as a single query
+            if content:
+                matched = [" ".join(content[:4])]
+
+        # Deduplicate and limit to 3 search phrases
+        search_queries = list(dict.fromkeys(matched))[:3]
+        if not search_queries:
+            search_queries = [description[:80]]  # absolute fallback
 
         state_label = f" in {state.upper()}" if state else ""
         sections = []
+        all_grants = {}  # dedupe by grant_key across queries
 
         # ── 1. Foundation grants by purpose (with state filter) ──
         if state:
-            await emitter.progress_update(f"Searching foundation grants for '{issue_terms}'{state_label}...")
-            data, error = await self._get_govcon("/foundations/grants/search", {
-                "search": issue_terms,
-                "state": state.upper(),
-                "page_size": 15,
-            })
-            if not error and data and data.get("results"):
-                items = data["results"]
-                total = data.get("total_results", len(items))
+            for sq in search_queries:
+                await emitter.progress_update(f"Searching foundation grants for '{sq}'{state_label}...")
+                data, error = await self._get_govcon("/foundations/grants/search", {
+                    "search": sq,
+                    "state": state.upper(),
+                    "page_size": 15,
+                })
+                if not error and data:
+                    for g in data.get("results", []):
+                        gk = g.get("grant_key", id(g))
+                        if gk not in all_grants:
+                            all_grants[gk] = g
+
+            items = sorted(all_grants.values(), key=lambda g: float(g.get("amount") or 0), reverse=True)
+            if items:
+                total = len(items)
                 lines = [f"## Foundation Grants to {state.upper()} Organizations\n"]
                 lines.append(f"Found **{total}** grants from private foundations to {state.upper()} recipients matching your work.\n")
                 foundations_seen = {}
@@ -249,16 +284,23 @@ class Tools:
                 sections.append("\n".join(lines))
 
         # ── 2. Foundation grants by purpose (national) ──
-        await emitter.progress_update(f"Searching national foundation grants for '{issue_terms}'...")
-        data, error = await self._get_govcon("/foundations/grants/search", {
-            "search": issue_terms,
-            "page_size": 10,
-        })
-        if not error and data and data.get("results"):
-            items = data["results"]
-            total = data.get("total_results", len(items))
+        national_grants = {}
+        for sq in search_queries[:2]:  # top 2 queries nationally
+            await emitter.progress_update(f"Searching national foundation grants for '{sq}'...")
+            data, error = await self._get_govcon("/foundations/grants/search", {
+                "search": sq,
+                "page_size": 10,
+            })
+            if not error and data:
+                for g in data.get("results", []):
+                    gk = g.get("grant_key", id(g))
+                    if gk not in national_grants and gk not in all_grants:
+                        national_grants[gk] = g
+
+        if national_grants:
+            items = sorted(national_grants.values(), key=lambda g: float(g.get("amount") or 0), reverse=True)
             lines = [f"## National Foundation Grants\n"]
-            lines.append(f"Found **{total}** grants nationally matching your work.\n")
+            lines.append(f"Found **{len(items)}** grants nationally matching your work.\n")
             for i, g in enumerate(items[:7], 1):
                 fname = g.get("foundation_name", "Unknown")
                 recipient = g.get("recipient_name", "Unknown")
@@ -269,14 +311,13 @@ class Tools:
                 if purpose:
                     lines.append(f"   {purpose}")
                 lines.append("")
-            if total > 10:
-                lines.append(f"_Use funding_search_grants_by_purpose(\"{issue_terms}\") to see all {total} results._\n")
             sections.append("\n".join(lines))
 
         # ── 3. Federal grants ──
-        await emitter.progress_update("Searching federal grant opportunities...")
+        primary_query = search_queries[0]
+        await emitter.progress_update(f"Searching federal grant opportunities for '{primary_query}'...")
         data, error = await self._get_govcon("/grants", {
-            "search": issue_terms,
+            "search": primary_query,
             "status": "P",
             "page_size": 5,
         })
@@ -308,7 +349,7 @@ class Tools:
         if state:
             await emitter.progress_update(f"Searching {state.upper()} state grants...")
             data, error = await self._get_funding("/state-grants", {
-                "search": issue_terms,
+                "search": primary_query,
                 "state_code": state.upper(),
                 "status": "open",
                 "page_size": 5,

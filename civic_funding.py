@@ -469,7 +469,7 @@ class Tools:
             purpose = grant.get("purpose", "")
             tax_year = grant.get("tax_year", "")
 
-            amount_str = f"${amount:,.0f}" if amount else "N/A"
+            amount_str = self._fmt_money(amount)
             lines.append(f"{i}. **{recipient}** — {amount_str}")
             detail_parts = []
             if purpose:

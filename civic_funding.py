@@ -346,20 +346,42 @@ class Tools:
             sections.append("\n".join(lines))
 
         # ── 4. State grants ──
+        # Try issue-area queries first, then fall back to showing all open state grants
         if state:
-            await emitter.progress_update(f"Searching {state.upper()} state grants...")
-            data, error = await self._get_funding("/state-grants", {
-                "search": primary_query,
-                "state_code": state.upper(),
-                "status": "open",
-                "page_size": 5,
-            })
-            if not error and data and data.get("results"):
-                items = data["results"]
-                total = data.get("total_results", len(items))
+            state_results = {}
+            # Try each search query
+            for sq in search_queries[:2]:
+                await emitter.progress_update(f"Searching {state.upper()} state grants for '{sq}'...")
+                data, error = await self._get_funding("/state-grants", {
+                    "search": sq,
+                    "state_code": state.upper(),
+                    "status": "open",
+                    "page_size": 5,
+                })
+                if not error and data:
+                    for g in data.get("results", []):
+                        gid = g.get("state_grant_id", id(g))
+                        if gid not in state_results:
+                            state_results[gid] = g
+
+            # If issue-area search found nothing, show all open grants in the state
+            if not state_results:
+                await emitter.progress_update(f"Showing all open {state.upper()} state grants...")
+                data, error = await self._get_funding("/state-grants", {
+                    "state_code": state.upper(),
+                    "status": "open",
+                    "page_size": 10,
+                })
+                if not error and data:
+                    for g in data.get("results", []):
+                        gid = g.get("state_grant_id", id(g))
+                        state_results[gid] = g
+
+            if state_results:
+                items = list(state_results.values())
                 lines = [f"## {state.upper()} State Grant Opportunities\n"]
-                lines.append(f"Found **{total}** open state grants.\n")
-                for i, g in enumerate(items[:5], 1):
+                lines.append(f"Found **{len(items)}** open state grants.\n")
+                for i, g in enumerate(items[:10], 1):
                     title = g.get("title", "Untitled")
                     agency = g.get("agency_name", "")
                     source_url = g.get("source_url", "")

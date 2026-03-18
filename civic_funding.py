@@ -27,6 +27,7 @@ FOLLOW-UP FUNCTIONS (use AFTER funding_discover, for drilling into specific resu
 - funding_get_foundation: Get full profile for a specific foundation by EIN
 - funding_search_foundation_grants: See what a SPECIFIC foundation has funded (requires EIN)
 - funding_get_state_grant: Get full details for a specific state grant
+- funding_search_rfps: Search for currently open foundation RFPs with deadlines and application links
 - funding_search_grants_by_purpose: Search foundation grants by issue area (funding_discover calls this internally — use directly only for refined follow-up searches)
 - funding_search_grants: Search federal grants (funding_discover calls this internally)
 - funding_search_state_grants: Search state grants (funding_discover calls this internally)
@@ -232,6 +233,36 @@ class Tools:
         sections = []
         all_grants = {}  # dedupe by grant_key across queries
 
+        # ── 0. Top funders in this state (regardless of purpose match) ──
+        if state:
+            await emitter.progress_update(f"Finding top funders in {state.upper()}...")
+            data, error = await self._get_govcon("/foundations/top-by-state", {
+                "state": state.upper(),
+                "limit": 15,
+            })
+            if not error and data and data.get("results"):
+                lines = [f"## Top Funders in {state.upper()}\n"]
+                lines.append("These foundations have the largest track record of giving to organizations in your state, regardless of specific purpose.\n")
+                for i, f in enumerate(data["results"][:10], 1):
+                    name = f.get("foundation_name", "Unknown")
+                    total = self._fmt_money(f.get("total_to_state"))
+                    count = f.get("grant_count", 0)
+                    years = f.get("years_active", "")
+                    lines.append(f"{i}. **{name}** — {total} across {count} grants")
+                    detail = []
+                    if years:
+                        detail.append(f"Years: {years}")
+                    purposes = f.get("sample_purposes", [])
+                    if purposes:
+                        detail.append(f"e.g., {purposes[0][:80]}")
+                    if detail:
+                        lines.append(f"   {' | '.join(detail)}")
+                    fein = f.get("foundation_ein", "")
+                    if fein:
+                        lines.append(f"   _Use funding_get_foundation({fein}) for profile_")
+                    lines.append("")
+                sections.append("\n".join(lines))
+
         # ── 1. Foundation grants by purpose (with state filter) ──
         if state:
             for sq in search_queries:
@@ -432,17 +463,101 @@ class Tools:
 
             sections.append("\n".join(lines))
 
+        # ── 5. Currently open RFPs ──
+        await emitter.progress_update("Checking for open application deadlines...")
+        rfp_params = {"status": "open", "page_size": 10}
+        if state:
+            # Search for RFPs from foundations active in this state
+            rfp_params["search"] = state.upper()
+        data, error = await self._get_govcon("/foundations/rfps", rfp_params)
+        if not error and data and data.get("results"):
+            rfp_items = data["results"]
+            lines = ["## Currently Open Opportunities\n"]
+            lines.append(f"Found **{data.get('total_results', len(rfp_items))}** foundations currently accepting applications.\n")
+            for i, rfp in enumerate(rfp_items[:8], 1):
+                title = rfp.get("title", "Untitled")
+                fname = rfp.get("foundation_name", "Unknown")
+                deadline = rfp.get("deadline", "Rolling/ongoing")
+                app_url = rfp.get("application_url", "")
+                lines.append(f"{i}. **{title}** — {fname}")
+                detail = [f"Deadline: {deadline}"]
+                min_a = rfp.get("min_award")
+                max_a = rfp.get("max_award")
+                if min_a or max_a:
+                    detail.append(f"Award: {self._fmt_money(min_a)}–{self._fmt_money(max_a)}")
+                lines.append(f"   {' | '.join(detail)}")
+                if app_url:
+                    lines.append(f"   [Apply]({app_url})")
+                lines.append("")
+            sections.append("\n".join(lines))
+
         # ── Assemble response ──
         if not sections:
             await emitter.success_update("No funding found")
             return f"No funding opportunities found for '{description}'{state_label}. Try broadening your description or removing the state filter."
 
         header = f"# Funding Landscape: {description}{state_label}\n\n"
-        header += "_Results from IRS 990-PF foundation filings, Grants.gov, and state grant portals._\n\n"
+        header += "_Results from IRS 990-PF foundation filings, state top-funder analysis, Grants.gov, state grant portals, and active RFPs._\n\n"
         result = header + "\n---\n\n".join(sections)
 
         await emitter.success_update("Funding landscape complete")
         return result
+
+    # ── Foundation RFPs (govcon-api) ─────────────────────────────────
+
+    async def funding_search_rfps(
+        self,
+        query: Optional[str] = None,
+        status: str = "open",
+        page: int = 1,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> str:
+        """
+        Search for currently open foundation RFPs (requests for proposals). Returns active grant opportunities with deadlines and application links.
+
+        :param query: Search term for RFP titles and descriptions
+        :param status: Filter by status — "open" (default), "closed", or "upcoming"
+        :param page: Page number for pagination
+        :return: List of matching RFPs with deadlines
+        """
+        emitter = EventEmitter(__event_emitter__)
+        await emitter.progress_update("Searching foundation RFPs...")
+
+        params = {"status": status, "page": page, "page_size": 15}
+        if query:
+            params["search"] = query
+
+        data, error = await self._get_govcon("/foundations/rfps", params)
+        if error:
+            return f"Error searching RFPs: {error}"
+
+        results = data.get("results", [])
+        total = data.get("total_results", 0)
+
+        if not results:
+            await emitter.success_update("No RFPs found")
+            return "No matching RFPs found."
+
+        lines = [f"# Active Foundation RFPs ({total} total)\n"]
+        for i, rfp in enumerate(results, 1):
+            title = rfp.get("title", "Untitled")
+            fname = rfp.get("foundation_name", "Unknown")
+            deadline = rfp.get("deadline", "Rolling")
+            app_url = rfp.get("application_url", "")
+            min_award = self._fmt_money(rfp.get("min_award"))
+            max_award = self._fmt_money(rfp.get("max_award"))
+
+            lines.append(f"{i}. **{title}** — {fname}")
+            detail = [f"Deadline: {deadline}"]
+            if min_award != "N/A" or max_award != "N/A":
+                detail.append(f"Award: {min_award}–{max_award}")
+            lines.append(f"   {' | '.join(detail)}")
+            if app_url:
+                lines.append(f"   [Apply]({app_url})")
+            lines.append("")
+
+        await emitter.success_update(f"Found {total} RFPs")
+        return "\n".join(lines)
 
     # ── Federal grants (govcon-api) ────────────────────────────────
 

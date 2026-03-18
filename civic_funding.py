@@ -6,7 +6,7 @@ id: civic_funding_intelligence
 description: Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), top funders by state, and active RFPs with deadlines.
 required_open_webui_version: 0.4.0
 requirements: httpx, pydantic
-version: 2.0.0
+version: 2.1.0
 license: MIT
 """
 
@@ -259,7 +259,8 @@ class Tools:
                         lines.append(f"   {' | '.join(detail)}")
                     fein = f.get("foundation_ein", "")
                     if fein:
-                        lines.append(f"   _Use funding_get_foundation({fein}) for profile_")
+                        pp_ein = fein.replace("-", "")
+                        lines.append(f"   [ProPublica Profile](https://projects.propublica.org/nonprofits/organizations/{pp_ein}) | _Use funding_get_foundation({fein}) for full details_")
                     lines.append("")
                 sections.append("\n".join(lines))
 
@@ -291,7 +292,8 @@ class Tools:
                     amount = self._fmt_money(g.get("amount"))
                     purpose = (g.get("purpose") or "")[:150]
                     year = g.get("tax_year", "")
-                    lines.append(f"{i}. **{fname}** → {recipient} — {amount}")
+                    pp_link = f"[{fname}](https://projects.propublica.org/nonprofits/organizations/{fein.replace('-', '')})" if fein else f"**{fname}**"
+                    lines.append(f"{i}. {pp_link} → {recipient} — {amount}")
                     detail = []
                     if purpose:
                         detail.append(purpose)
@@ -334,11 +336,13 @@ class Tools:
             lines.append(f"Found **{len(items)}** grants nationally matching your work.\n")
             for i, g in enumerate(items[:7], 1):
                 fname = g.get("foundation_name", "Unknown")
+                fein = g.get("foundation_ein", "")
                 recipient = g.get("recipient_name", "Unknown")
                 rstate = g.get("recipient_state", "")
                 amount = self._fmt_money(g.get("amount"))
                 purpose = (g.get("purpose") or "")[:150]
-                lines.append(f"{i}. **{fname}** → {recipient} ({rstate}) — {amount}")
+                pp_link = f"[{fname}](https://projects.propublica.org/nonprofits/organizations/{fein.replace('-', '')})" if fein else f"**{fname}**"
+                lines.append(f"{i}. {pp_link} → {recipient} ({rstate}) — {amount}")
                 if purpose:
                     lines.append(f"   {purpose}")
                 lines.append("")
@@ -486,8 +490,11 @@ class Tools:
                 if min_a or max_a:
                     detail.append(f"Award: {self._fmt_money(min_a)}–{self._fmt_money(max_a)}")
                 lines.append(f"   {' | '.join(detail)}")
+                source = rfp.get("source_url", "")
                 if app_url:
                     lines.append(f"   [Apply]({app_url})")
+                elif source:
+                    lines.append(f"   [More info]({source})")
                 lines.append("")
             sections.append("\n".join(lines))
 

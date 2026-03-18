@@ -314,44 +314,62 @@ class Tools:
             sections.append("\n".join(lines))
 
         # ── 3. Federal grants ──
+        # Only show grants with close dates in the future
+        from datetime import date as _date
+        today_str = _date.today().isoformat()
+
         primary_query = search_queries[0]
         await emitter.progress_update(f"Searching federal grant opportunities for '{primary_query}'...")
         data, error = await self._get_govcon("/grants", {
             "search": primary_query,
             "status": "P",
-            "page_size": 5,
+            "page_size": 25,
         })
         if not error and data and data.get("results"):
-            items = data["results"]
-            total = data.get("total_results", len(items))
-            # Filter to recent-ish grants (close_date in future or recent)
-            lines = [f"## Federal Grant Opportunities\n"]
-            lines.append(f"Found **{total}** open federal grants.\n")
-            status_labels = {"P": "Open", "F": "Forecasted"}
-            for i, g in enumerate(items[:5], 1):
-                title = g.get("title", "Untitled")
-                agency = g.get("agency_name") or g.get("agency_code", "")
-                close = (g.get("close_date") or "")[:10]
-                gid = g.get("grant_id", "")
-                lines.append(f"{i}. **{title}**")
-                detail = []
-                if agency:
-                    detail.append(f"Agency: {agency}")
-                if close:
-                    detail.append(f"Closes: {close}")
-                lines.append(f"   {' | '.join(detail)}")
-                if gid:
-                    lines.append(f"   _Use funding_get_grant({gid}) for full details_")
-                lines.append("")
-            sections.append("\n".join(lines))
+            # Filter to grants with future close dates only
+            current = [g for g in data["results"]
+                       if (g.get("close_date") or "9999") >= today_str]
+            if current:
+                lines = [f"## Federal Grant Opportunities\n"]
+                lines.append(f"Found **{len(current)}** currently open federal grants.\n")
+                for i, g in enumerate(current[:5], 1):
+                    title = g.get("title", "Untitled")
+                    agency = g.get("agency_name") or g.get("agency_code", "")
+                    close = (g.get("close_date") or "")[:10]
+                    gid = g.get("grant_id", "")
+                    lines.append(f"{i}. **{title}**")
+                    detail = []
+                    if agency:
+                        detail.append(f"Agency: {agency}")
+                    if close:
+                        detail.append(f"Closes: {close}")
+                    lines.append(f"   {' | '.join(detail)}")
+                    if gid:
+                        lines.append(f"   _Use funding_get_grant({gid}) for full details_")
+                    lines.append("")
+                sections.append("\n".join(lines))
+            else:
+                sections.append("## Federal Grant Opportunities\n\nNo currently open federal grants match your search. Federal civic engagement funding is limited — most domestic nonprofit funding comes from private foundations (see above).\n")
+        else:
+            sections.append("## Federal Grant Opportunities\n\nNo federal grants matched your search.\n")
 
         # ── 4. State grants ──
-        # Try issue-area queries first, then fall back to showing all open state grants
         if state:
-            state_results = {}
-            # Try each search query
+            state_matched = {}
+            state_total_open = 0
+
+            # First: get the total count of open grants in the state
+            await emitter.progress_update(f"Checking {state.upper()} state grants...")
+            data, error = await self._get_funding("/state-grants", {
+                "state_code": state.upper(),
+                "status": "open",
+                "page_size": 1,
+            })
+            if not error and data:
+                state_total_open = data.get("total_results", 0)
+
+            # Try issue-area searches
             for sq in search_queries[:2]:
-                await emitter.progress_update(f"Searching {state.upper()} state grants for '{sq}'...")
                 data, error = await self._get_funding("/state-grants", {
                     "search": sq,
                     "state_code": state.upper(),
@@ -361,27 +379,20 @@ class Tools:
                 if not error and data:
                     for g in data.get("results", []):
                         gid = g.get("state_grant_id", id(g))
-                        if gid not in state_results:
-                            state_results[gid] = g
+                        if gid not in state_matched:
+                            state_matched[gid] = g
 
-            # If issue-area search found nothing, show all open grants in the state
-            if not state_results:
-                await emitter.progress_update(f"Showing all open {state.upper()} state grants...")
-                data, error = await self._get_funding("/state-grants", {
-                    "state_code": state.upper(),
-                    "status": "open",
-                    "page_size": 10,
-                })
-                if not error and data:
-                    for g in data.get("results", []):
-                        gid = g.get("state_grant_id", id(g))
-                        state_results[gid] = g
+            lines = [f"## {state.upper()} State Grant Opportunities\n"]
 
-            if state_results:
-                items = list(state_results.values())
-                lines = [f"## {state.upper()} State Grant Opportunities\n"]
-                lines.append(f"Found **{len(items)}** open state grants.\n")
-                for i, g in enumerate(items[:10], 1):
+            if state_matched:
+                # We found issue-specific matches
+                items = list(state_matched.values())
+                lines.append(f"Found **{len(items)}** state grants matching your work")
+                if state_total_open > len(items):
+                    lines.append(f" (out of **{state_total_open}** total open grants in {state.upper()}).\n")
+                else:
+                    lines.append(".\n")
+                for i, g in enumerate(items[:8], 1):
                     title = g.get("title", "Untitled")
                     agency = g.get("agency_name", "")
                     source_url = g.get("source_url", "")
@@ -391,7 +402,35 @@ class Tools:
                     if source_url:
                         lines.append(f"   [View on state portal]({source_url})")
                     lines.append("")
-                sections.append("\n".join(lines))
+            elif state_total_open > 0:
+                # No matches but there ARE grants in the state — show summary
+                lines.append(f"No state grants specifically matched your search terms, but **{state.upper()} has {state_total_open} open grant programs**.\n")
+
+                # Get a sample to show what agencies are offering grants
+                data, error = await self._get_funding("/state-grants", {
+                    "state_code": state.upper(),
+                    "status": "open",
+                    "page_size": 25,
+                })
+                if not error and data:
+                    # Group by agency to show what's available
+                    agencies = {}
+                    for g in data.get("results", []):
+                        ag = g.get("agency_name", "Unknown")
+                        if ag not in agencies:
+                            agencies[ag] = []
+                        agencies[ag].append(g.get("title", "Untitled"))
+
+                    lines.append("**Open grants by agency:**\n")
+                    for ag, titles in sorted(agencies.items()):
+                        example = titles[0]
+                        count_str = f" ({len(titles)} programs)" if len(titles) > 1 else ""
+                        lines.append(f"- **{ag}**{count_str} — e.g., {example}")
+                    lines.append(f"\n_Use funding_search_state_grants(state=\"{state.upper()}\") to browse all {state_total_open} open grants, or add a search term to filter._")
+            else:
+                lines.append(f"No open state grant programs found in {state.upper()} in our database.\n")
+
+            sections.append("\n".join(lines))
 
         # ── Assemble response ──
         if not sections:

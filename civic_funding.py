@@ -6,7 +6,7 @@ id: civic_funding_intelligence
 description: Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), top funders by state, and active RFPs with deadlines.
 required_open_webui_version: 0.4.0
 requirements: httpx, pydantic
-version: 2.1.0
+version: 2.2.0
 license: MIT
 """
 
@@ -241,8 +241,8 @@ class Tools:
                 "limit": 15,
             })
             if not error and data and data.get("results"):
-                lines = [f"## Top Funders in {state.upper()}\n"]
-                lines.append("These foundations have the largest track record of giving to organizations in your state, regardless of specific purpose.\n")
+                lines = [f"## Top Funders in {state.upper()} (by total giving to state)\n"]
+                lines.append("These foundations give the most to organizations in your state — worth researching even if their stated purpose doesn't match your exact work.\n")
                 for i, f in enumerate(data["results"][:10], 1):
                     name = f.get("foundation_name", "Unknown")
                     total = self._fmt_money(f.get("total_to_state"))
@@ -282,8 +282,8 @@ class Tools:
             items = sorted(all_grants.values(), key=lambda g: float(g.get("amount") or 0), reverse=True)
             if items:
                 total = len(items)
-                lines = [f"## Foundation Grants to {state.upper()} Organizations\n"]
-                lines.append(f"Found **{total}** grants from private foundations to {state.upper()} recipients matching your work.\n")
+                lines = [f"## Priority Matches: Foundations That Fund Your Kind of Work in {state.upper()}\n"]
+                lines.append(f"Found **{total}** grants from private foundations to {state.upper()} organizations doing similar work. These are your strongest leads.\n")
                 foundations_seen = {}
                 for i, g in enumerate(items[:10], 1):
                     fname = g.get("foundation_name", "Unknown")
@@ -310,7 +310,7 @@ class Tools:
 
                 if foundations_seen:
                     sorted_f = sorted(foundations_seen.values(), key=lambda x: x["total"], reverse=True)[:5]
-                    lines.append("**Top funders in your state for this work:**")
+                    lines.append("**Summary — your top targets from the matches above:**")
                     for f in sorted_f:
                         lines.append(f"- {f['name']} — {f['count']} grants, {self._fmt_money(f['total'])}")
                     lines.append("")
@@ -332,8 +332,8 @@ class Tools:
 
         if national_grants:
             items = sorted(national_grants.values(), key=lambda g: float(g.get("amount") or 0), reverse=True)
-            lines = [f"## National Foundation Grants\n"]
-            lines.append(f"Found **{len(items)}** grants nationally matching your work.\n")
+            lines = [f"## National Foundations Funding Similar Work\n"]
+            lines.append(f"Found **{len(items)}** grants nationally to organizations doing similar work — these funders may also consider {state.upper() if state else 'your'} organizations.\n")
             for i, g in enumerate(items[:7], 1):
                 fname = g.get("foundation_name", "Unknown")
                 fein = g.get("foundation_ein", "")
@@ -476,8 +476,8 @@ class Tools:
         data, error = await self._get_govcon("/foundations/rfps", rfp_params)
         if not error and data and data.get("results"):
             rfp_items = data["results"]
-            lines = ["## Currently Open Opportunities\n"]
-            lines.append(f"Found **{data.get('total_results', len(rfp_items))}** foundations currently accepting applications.\n")
+            lines = ["## Apply Now: Currently Open Opportunities\n"]
+            lines.append(f"**{data.get('total_results', len(rfp_items))}** foundations currently accepting applications.\n")
             for i, rfp in enumerate(rfp_items[:8], 1):
                 title = rfp.get("title", "Untitled")
                 fname = rfp.get("foundation_name", "Unknown")
@@ -498,14 +498,28 @@ class Tools:
                 lines.append("")
             sections.append("\n".join(lines))
 
-        # ── Assemble response ──
+        # ── Assemble response with consistent skeleton ──
         if not sections:
             await emitter.success_update("No funding found")
             return f"No funding opportunities found for '{description}'{state_label}. Try broadening your description or removing the state filter."
 
         header = f"# Funding Landscape: {description}{state_label}\n\n"
-        header += "_Results from IRS 990-PF foundation filings, state top-funder analysis, Grants.gov, state grant portals, and active RFPs._\n\n"
-        result = header + "\n---\n\n".join(sections)
+        header += "_Data from IRS 990-PF filings (3M+ grants), state grant portals, Grants.gov, and foundation RFP crawls._\n\n"
+
+        body = "\n---\n\n".join(sections)
+
+        # Locked next-steps section — LLM preserves this structure every time
+        next_steps = "\n---\n\n## What To Do Next\n\n"
+        next_steps += "**Dig deeper into a specific foundation:**\n"
+        next_steps += "- Ask: _\"Pull the full profile and NM grant history for [foundation name]\"_\n"
+        next_steps += "- Ask: _\"What has [foundation name] funded in New Mexico?\"_\n\n"
+        next_steps += "**Refine your search:**\n"
+        next_steps += "- Ask: _\"Search for grants related to [voter engagement / democracy / media / narrative change]\"_\n"
+        if state:
+            next_steps += f"- Ask: _\"Show me all {state.upper()} state grants\"_ to browse {state.upper()}'s full open grant list\n"
+        next_steps += "\n**Currently available tool functions:** funding_get_foundation(EIN), funding_search_foundation_grants(EIN), funding_search_state_grants(state), funding_search_rfps(query)\n"
+
+        result = header + body + next_steps
 
         await emitter.success_update("Funding landscape complete")
         return result

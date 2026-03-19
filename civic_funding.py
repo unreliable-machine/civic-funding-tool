@@ -511,8 +511,9 @@ class Tools:
         # Locked next-steps section — LLM preserves this structure every time
         next_steps = "\n---\n\n## What To Do Next\n\n"
         next_steps += "**Dig deeper into a specific foundation:**\n"
-        next_steps += "- Ask: _\"Pull the full profile and NM grant history for [foundation name]\"_\n"
-        next_steps += "- Ask: _\"What has [foundation name] funded in New Mexico?\"_\n\n"
+        state_ref = f" {state.upper()}" if state else ""
+        next_steps += f"- Ask: _\"Pull the full profile and{state_ref} grant history for [foundation name]\"_\n"
+        next_steps += f"- Ask: _\"What has [foundation name] funded{' in ' + state.upper() if state else ''}?\"_\n\n"
         next_steps += "**Refine your search:**\n"
         next_steps += "- Ask: _\"Search for grants related to [voter engagement / democracy / media / narrative change]\"_\n"
         if state:

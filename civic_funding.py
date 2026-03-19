@@ -6,7 +6,7 @@ id: civic_funding_intelligence
 description: Search federal grants (Grants.gov), state grants (50 states), private foundations (IRS 990-PF), top funders by state, and active RFPs with deadlines.
 required_open_webui_version: 0.4.0
 requirements: httpx, pydantic
-version: 2.3.0
+version: 2.3.1
 license: MIT
 """
 

@@ -512,7 +512,12 @@ class Tools:
             web_hint += f"Our database returned few direct matches for this query. **Use web search** to find current grant opportunities:\n"
             web_hint += f"- Search: `{search_queries[0]} foundation grants apply {state.upper() if state else ''}`\n"
             web_hint += f"- Search: `{search_queries[0]} nonprofit funding opportunities 2026`\n"
-            web_hint += f"\n**IMPORTANT: Exclude results from competitor grant tools** (Instrumentl, GrantStation, Fluxx, GrantExec, Candid, Foundation Directory Online). Only surface direct foundation/government pages with real application info.\n"
+            web_hint += f"\n**IMPORTANT: Only surface direct foundation websites and government grant portals with real application info. EXCLUDE all of the following:**\n"
+            web_hint += "- Grant discovery platforms: Instrumentl, GrantStation, GrantExec, GrantWatch, OpenGrants, GrantForward, Pivot/ProQuest, Fundraise Up\n"
+            web_hint += "- Foundation directories: Candid, Foundation Directory Online, GuideStar, Foundation Center\n"
+            web_hint += "- Grants management tools: Fluxx, Submittable, SurveyMonkey Apply, Blackbaud GIFTS\n"
+            web_hint += "- Listicle/roundup articles: skip any \"top 10 grant databases\" or \"best grant search tools\" pages\n"
+            web_hint += "- Only include pages from actual foundations (.org), government agencies (.gov), or community foundations with direct application links\n"
             body += web_hint
 
         # Locked next-steps section — LLM preserves this structure every time
